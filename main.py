@@ -1,391 +1,274 @@
 import sys
 import struct
 import os
+import zlib
+import json
 
-# --- Constants & Configuration ---
+# --- Configuration & Constants ---
 DB_FILE_NAME = "mydb.db"
-PAGE_SIZE = 4096
-TABLE_MAX_PAGES = 100
+IDX_FILE_NAME = "email.idx"
+WAL_FILE_NAME = "wal.log"
 
-# Row Format
+# INCREASED PAGE SIZE: 8KB allows internal nodes to hold ~1022 pointers.
+PAGE_SIZE = 8192 
+TABLE_MAX_PAGES = 5000
+
+# Row Format: ID (4) + Username (32) + Email (255) = 291 bytes
 ID_SIZE = 4
 USERNAME_SIZE = 32
 EMAIL_SIZE = 255
 ROW_SIZE = ID_SIZE + USERNAME_SIZE + EMAIL_SIZE
 ROW_FMT = f'I{USERNAME_SIZE}s{EMAIL_SIZE}s'
 
-# Common Node Header Layout
-NODE_TYPE_SIZE = 1
-NODE_ROOT_SIZE = 1
-NODE_PARENT_SIZE = 4
-NODE_NUM_CELLS_SIZE = 4
-NODE_NEXT_LEAF_SIZE = 4 
-COMMON_NODE_HEADER_SIZE = NODE_TYPE_SIZE + NODE_ROOT_SIZE + NODE_PARENT_SIZE + NODE_NUM_CELLS_SIZE + NODE_NEXT_LEAF_SIZE
-
-# Leaf Node Layout
-LEAF_NODE_KEY_SIZE = 4
-LEAF_NODE_VALUE_SIZE = ROW_SIZE
-LEAF_NODE_CELL_SIZE = LEAF_NODE_KEY_SIZE + LEAF_NODE_VALUE_SIZE
-LEAF_NODE_SPACE_FOR_CELLS = PAGE_SIZE - COMMON_NODE_HEADER_SIZE
-LEAF_NODE_MAX_CELLS = LEAF_NODE_SPACE_FOR_CELLS // LEAF_NODE_CELL_SIZE
-
-# Internal Node Layout
-# Internal Cell: [Key (4 bytes), Child_Page_Num (4 bytes)]
-INTERNAL_NODE_KEY_SIZE = 4
-INTERNAL_NODE_CHILD_SIZE = 4
-INTERNAL_NODE_CELL_SIZE = INTERNAL_NODE_KEY_SIZE + INTERNAL_NODE_CHILD_SIZE
-INTERNAL_NODE_SPACE_FOR_CELLS = PAGE_SIZE - COMMON_NODE_HEADER_SIZE
-INTERNAL_NODE_MAX_CELLS = INTERNAL_NODE_SPACE_FOR_CELLS // INTERNAL_NODE_CELL_SIZE
-
-# Enums
 NODE_INTERNAL = 0
 NODE_LEAF = 1
+MAX_INT_KEY = 4294967295
 
-# Maximum Integer (Sentinel for the rightmost child)
-MAX_INT_KEY = 4294967295 # 2^32 - 1
+# --- Global Helper Functions ---
+def serialize_row(row_id, username, email):
+    return struct.pack(ROW_FMT, row_id, username.encode('utf-8'), email.encode('utf-8'))
 
-# --- Classes ---
+def deserialize_row(data):
+    row_id, user_b, email_b = struct.unpack(ROW_FMT, data)
+    return row_id, user_b.decode('utf-8').rstrip('\x00'), email_b.decode('utf-8').rstrip('\x00')
 
+def hash_email(email):
+    return zlib.crc32(email.encode('utf-8')) & 0xffffffff
+
+# --- Write-Ahead Log ---
+class WAL:
+    def __init__(self, filename=WAL_FILE_NAME):
+        self.filename = filename
+        self.file = open(filename, "a+")
+        self.txn_counter = 0
+
+    def log_start(self, row_id, username, email):
+        self.txn_counter += 1
+        entry = {"txn_id": self.txn_counter, "status": "START", "action": "INSERT", "data": {"id": row_id, "user": username, "email": email}}
+        self.file.write(json.dumps(entry) + "\n")
+        self.file.flush()
+        os.fsync(self.file.fileno())
+        return self.txn_counter
+
+    def log_commit(self, txn_id):
+        entry = {"txn_id": txn_id, "status": "COMMIT"}
+        self.file.write(json.dumps(entry) + "\n")
+        self.file.flush()
+        os.fsync(self.file.fileno())
+
+    def recover(self, db, idx):
+        self.file.seek(0)
+        active_txns = {}
+        for line in self.file:
+            if not line.strip(): continue
+            entry = json.loads(line)
+            if entry["status"] == "START": active_txns[entry["txn_id"]] = entry["data"]
+            elif entry["status"] == "COMMIT" and entry["txn_id"] in active_txns: del active_txns[entry["txn_id"]]
+        
+        if active_txns:
+            print(f"CRASH DETECTED. Recovering {len(active_txns)} txns...")
+            for txn_id, data in active_txns.items():
+                db.insert(data['id'], serialize_row(data['id'], data['user'], data['email']))
+                idx.insert(hash_email(data['email']), struct.pack('I', data['id']))
+                self.log_commit(txn_id)
+
+# --- Disk Pager ---
 class Pager:
     def __init__(self, filename):
         self.filename = filename
-        if not os.path.exists(filename):
-            with open(filename, "wb") as f:
-                pass
+        if not os.path.exists(filename): open(filename, "wb").close()
         self.file = open(filename, "r+b")
         self.file.seek(0, 2)
         self.file_length = self.file.tell()
         self.num_pages = self.file_length // PAGE_SIZE
+        if self.file_length % PAGE_SIZE: self.num_pages += 1
         self.pages = [None] * TABLE_MAX_PAGES
 
     def get_page(self, page_num):
-        if page_num >= TABLE_MAX_PAGES:
-            raise Exception(f"Page number {page_num} out of bounds.")
-        
         if self.pages[page_num] is None:
-            num_pages_in_file = self.file_length // PAGE_SIZE
-            if self.file_length % PAGE_SIZE:
-                 num_pages_in_file += 1
-            
-            if page_num < num_pages_in_file:
+            if page_num < self.num_pages:
                 self.file.seek(page_num * PAGE_SIZE)
                 data = self.file.read(PAGE_SIZE)
-                self.pages[page_num] = bytearray(data)
+                self.pages[page_num] = bytearray(data.ljust(PAGE_SIZE, b'\x00'))
             else:
                 self.pages[page_num] = bytearray(PAGE_SIZE)
-                
+                self.num_pages = max(self.num_pages, page_num + 1)
         return self.pages[page_num]
 
-    def get_unused_page_num(self):
-        return self.num_pages
-
     def flush(self, page_num):
-        if self.pages[page_num] is None:
-            return
+        if self.pages[page_num] is None: return
         self.file.seek(page_num * PAGE_SIZE)
         self.file.write(self.pages[page_num])
 
     def close(self):
         for i, page in enumerate(self.pages):
-            if page:
-                self.flush(i)
+            if page: self.flush(i)
         self.file.close()
 
-class Table:
-    def __init__(self):
-        self.pager = Pager(DB_FILE_NAME)
+# --- The Advanced B-Tree Engine ---
+class BTree:
+    def __init__(self, filename, val_size):
+        self.val_size = val_size
+        self.key_size = 4
+        self.leaf_cell_size = self.key_size + self.val_size
+        self.internal_cell_size = 8
         
-        if self.pager.num_pages == 0:
-            # New DB: Initialize Page 0 as Leaf Root
-            root_node = self.pager.get_page(0)
-            initialize_leaf_node(root_node)
-            set_node_root(root_node, True)
-            self.pager.num_pages = 1
+        self.OFF_TYPE, self.OFF_ROOT, self.OFF_PARENT, self.OFF_CELLS, self.OFF_NEXT = 0, 1, 2, 6, 10
+        self.header_size = 14
+        self.max_leaf_cells = (PAGE_SIZE - self.header_size) // self.leaf_cell_size
+        self.max_internal_cells = (PAGE_SIZE - self.header_size) // self.internal_cell_size
+        
+        self.pager = Pager(filename)
+        if self.pager.file_length == 0:
+            self._init_leaf(self.pager.get_page(0), is_root=True)
+
+    def _init_leaf(self, node, is_root=False):
+        struct.pack_into('BBII', node, 0, NODE_LEAF, 1 if is_root else 0, 0, 0)
+        struct.pack_into('I', node, self.OFF_NEXT, 0)
+
+    def _init_internal(self, node, is_root=False):
+        struct.pack_into('BBII', node, 0, NODE_INTERNAL, 1 if is_root else 0, 0, 0)
+
+    # --- List-Based Memory Parsers ---
+    def _read_leaf(self, node):
+        cells = []
+        for i in range(struct.unpack_from('I', node, self.OFF_CELLS)[0]):
+            off = self.header_size + i * self.leaf_cell_size
+            cells.append((struct.unpack_from('I', node, off)[0], node[off+4:off+self.leaf_cell_size]))
+        return cells
+
+    def _write_leaf(self, node, cells):
+        struct.pack_into('I', node, self.OFF_CELLS, len(cells))
+        for i, (k, v) in enumerate(cells):
+            off = self.header_size + i * self.leaf_cell_size
+            struct.pack_into('I', node, off, k)
+            node[off+4:off+self.leaf_cell_size] = v
+
+    def _read_internal(self, node):
+        cells = []
+        for i in range(struct.unpack_from('I', node, self.OFF_CELLS)[0]):
+            off = self.header_size + i * self.internal_cell_size
+            cells.append({'key': struct.unpack_from('I', node, off)[0], 'ptr': struct.unpack_from('I', node, off+4)[0]})
+        return cells
+
+    def _write_internal(self, node, cells):
+        struct.pack_into('I', node, self.OFF_CELLS, len(cells))
+        for i, c in enumerate(cells):
+            off = self.header_size + i * self.internal_cell_size
+            struct.pack_into('I', node, off, c['key'])
+            struct.pack_into('I', node, off+4, c['ptr'])
+
+    # --- Core Logic ---
+    def find_leaf_page(self, key):
+        page_num = 0
+        node = self.pager.get_page(page_num)
+        while struct.unpack_from('B', node, self.OFF_TYPE)[0] == NODE_INTERNAL:
+            cells = self._read_internal(node)
+            page_num = next((c['ptr'] for c in cells if key <= c['key']), cells[-1]['ptr'])
+            node = self.pager.get_page(page_num)
+        return page_num
+
+    def search(self, key):
+        node = self.pager.get_page(self.find_leaf_page(key))
+        return next((v for k, v in self._read_leaf(node) if k == key), None)
+
+    def insert(self, key, val_bytes):
+        page_num = self.find_leaf_page(key)
+        node = self.pager.get_page(page_num)
+        cells = self._read_leaf(node)
+        
+        cells.append((key, val_bytes))
+        cells.sort(key=lambda x: x[0])
+        
+        if len(cells) <= self.max_leaf_cells:
+            self._write_leaf(node, cells)
+            return
+
+        # SPLIT LEAF LOGIC
+        split_idx = len(cells) // 2
+        self._write_leaf(node, cells[:split_idx])
+        
+        new_page_num = self.pager.num_pages
+        new_node = self.pager.get_page(new_page_num)
+        self._init_leaf(new_node)
+        self._write_leaf(new_node, cells[split_idx:])
+        
+        # Pointers
+        struct.pack_into('I', new_node, self.OFF_NEXT, struct.unpack_from('I', node, self.OFF_NEXT)[0])
+        struct.pack_into('I', node, self.OFF_NEXT, new_page_num)
+        left_max_key = cells[:split_idx][-1][0]
+        
+        # PARENT ROUTING
+        if struct.unpack_from('B', node, self.OFF_ROOT)[0]:
+            left_page_num = self.pager.num_pages
+            left_node = self.pager.get_page(left_page_num)
+            left_node[:] = node[:]
+            struct.pack_into('B', left_node, self.OFF_ROOT, 0)
+            
+            self._init_internal(node, is_root=True)
+            self._write_internal(node, [{'key': left_max_key, 'ptr': left_page_num}, {'key': MAX_INT_KEY, 'ptr': new_page_num}])
+            struct.pack_into('I', left_node, self.OFF_PARENT, 0)
+            struct.pack_into('I', new_node, self.OFF_PARENT, 0)
+        else:
+            parent_page = struct.unpack_from('I', node, self.OFF_PARENT)[0]
+            struct.pack_into('I', new_node, self.OFF_PARENT, parent_page)
+            self._insert_internal(parent_page, left_max_key, page_num, new_page_num)
+
+    def _insert_internal(self, page_num, left_max_key, left_child, right_child):
+        node = self.pager.get_page(page_num)
+        cells = self._read_internal(node)
+        
+        for i, c in enumerate(cells):
+            if c['ptr'] == left_child:
+                old_key = c['key']
+                cells[i]['key'] = left_max_key
+                cells.insert(i + 1, {'key': old_key, 'ptr': right_child})
+                break
+                
+        if len(cells) <= self.max_internal_cells:
+            self._write_internal(node, cells)
+        else:
+            print("FATAL: Internal Node limit reached. Increase PAGE_SIZE further.")
+            sys.exit(1)
 
     def close(self):
         self.pager.close()
 
-class Cursor:
-    def __init__(self, table):
-        self.table = table
-        self.page_num = 0
-        self.cell_num = 0
-        self.end_of_table = False 
-
-    def start_reading(self):
-        # Find the Left-most leaf to start scanning
-        page_num = 0
-        node = self.table.pager.get_page(page_num)
-        node_type = get_node_type(node)
-
-        while node_type == NODE_INTERNAL:
-            # Always follow the left-most pointer (Cell 0's child)
-            # Internal Cell structure: [Key, Child_Page]
-            # Actually, standard B-tree: Ptr0, Key0, Ptr1... 
-            # Our Simplified Model: (MaxKey, ChildPtr).
-            # So just grab ChildPtr from Cell 0.
-            
-            offset = COMMON_NODE_HEADER_SIZE + INTERNAL_NODE_KEY_SIZE
-            child_page = struct.unpack_from('I', node, offset)[0]
-            
-            page_num = child_page
-            node = self.table.pager.get_page(page_num)
-            node_type = get_node_type(node)
-
-        self.page_num = page_num
-        self.cell_num = 0
-        
-        num_cells = get_node_num_cells(node)
-        self.end_of_table = (num_cells == 0)
-        return self
-
-    def advance(self):
-        node = self.table.pager.get_page(self.page_num)
-        num_cells = get_node_num_cells(node)
-        
-        self.cell_num += 1
-        if self.cell_num >= num_cells:
-            next_page = get_node_next_leaf(node)
-            if next_page == 0:
-                self.end_of_table = True
-            else:
-                self.page_num = next_page
-                self.cell_num = 0
-
-# --- Node Helper Functions ---
-
-def get_node_type(node):
-    return struct.unpack_from('B', node, 0)[0]
-
-def set_node_type(node, type_val):
-    struct.pack_into('B', node, 0, type_val)
-
-def set_node_root(node, is_root):
-    val = 1 if is_root else 0
-    struct.pack_into('B', node, NODE_TYPE_SIZE, val)
-
-def get_node_num_cells(node):
-    return struct.unpack_from('I', node, NODE_TYPE_SIZE + NODE_ROOT_SIZE + NODE_PARENT_SIZE)[0]
-
-def set_node_num_cells(node, num_cells):
-    struct.pack_into('I', node, NODE_TYPE_SIZE + NODE_ROOT_SIZE + NODE_PARENT_SIZE, num_cells)
-
-def get_node_next_leaf(node):
-    offset = NODE_TYPE_SIZE + NODE_ROOT_SIZE + NODE_PARENT_SIZE + NODE_NUM_CELLS_SIZE
-    return struct.unpack_from('I', node, offset)[0]
-
-def set_node_next_leaf(node, next_leaf_page):
-    offset = NODE_TYPE_SIZE + NODE_ROOT_SIZE + NODE_PARENT_SIZE + NODE_NUM_CELLS_SIZE
-    struct.pack_into('I', node, offset, next_leaf_page)
-
-def get_node_max_key(node):
-    num_cells = get_node_num_cells(node)
-    if num_cells == 0:
-        return 0
-    # Key is at the start of the cell in Leaf Nodes
-    offset = COMMON_NODE_HEADER_SIZE + ((num_cells - 1) * LEAF_NODE_CELL_SIZE)
-    return struct.unpack_from('I', node, offset)[0]
-
-def initialize_leaf_node(node):
-    set_node_type(node, NODE_LEAF)
-    set_node_root(node, False)
-    set_node_num_cells(node, 0)
-    set_node_next_leaf(node, 0)
-
-def initialize_internal_node(node):
-    set_node_type(node, NODE_INTERNAL)
-    set_node_root(node, False)
-    set_node_num_cells(node, 0)
-
-# --- Core Logic ---
-
-def serialize_row(row_id, username, email):
-    return struct.pack(ROW_FMT, row_id, username.encode('utf-8'), email.encode('utf-8'))
-
-def deserialize_row(data):
-    row_id, username_bytes, email_bytes = struct.unpack(ROW_FMT, data)
-    username = username_bytes.decode('utf-8').rstrip('\x00')
-    email = email_bytes.decode('utf-8').rstrip('\x00')
-    return row_id, username, email
-
-def split_root_node(cursor, row_id, row_bytes):
-    # 1. Create Left (Page 1) and Right (Page 2) Children
-    root_node = cursor.table.pager.get_page(0)
-    page_1_num = cursor.table.pager.get_unused_page_num()
-    cursor.table.pager.num_pages += 1
-    page_2_num = cursor.table.pager.get_unused_page_num()
-    cursor.table.pager.num_pages += 1
-    
-    new_left_node = cursor.table.pager.get_page(page_1_num)
-    initialize_leaf_node(new_left_node)
-    
-    new_right_node = cursor.table.pager.get_page(page_2_num)
-    initialize_leaf_node(new_right_node)
-    
-    set_node_next_leaf(new_left_node, page_2_num)
-    
-    # 2. Copy Data to Left/Right
-    old_max = LEAF_NODE_MAX_CELLS
-    split_index = old_max // 2
-    
-    # Left Half
-    for i in range(split_index):
-        src = COMMON_NODE_HEADER_SIZE + (i * LEAF_NODE_CELL_SIZE)
-        dest = COMMON_NODE_HEADER_SIZE + (i * LEAF_NODE_CELL_SIZE)
-        new_left_node[dest : dest + LEAF_NODE_CELL_SIZE] = root_node[src : src + LEAF_NODE_CELL_SIZE]
-    set_node_num_cells(new_left_node, split_index)
-    
-    # Right Half
-    for i in range(split_index, old_max):
-        src = COMMON_NODE_HEADER_SIZE + (i * LEAF_NODE_CELL_SIZE)
-        dest_index = i - split_index
-        dest = COMMON_NODE_HEADER_SIZE + (dest_index * LEAF_NODE_CELL_SIZE)
-        new_right_node[dest : dest + LEAF_NODE_CELL_SIZE] = root_node[src : src + LEAF_NODE_CELL_SIZE]
-    set_node_num_cells(new_right_node, old_max - split_index)
-    
-    # 3. Determine where new row goes and insert it
-    # We need the max key of the Left node to decide key for Internal Node
-    left_max_key = get_node_max_key(new_left_node)
-    
-    target_node = new_right_node 
-    if row_id <= left_max_key:
-        target_node = new_left_node # Should go to left (logic simplified)
-        # Re-insert logic skipped for brevity, assuming Append-Only workload
-    
-    # Insert new row into Right Node (Assuming sequential ID insert)
-    right_count = get_node_num_cells(new_right_node)
-    dest = COMMON_NODE_HEADER_SIZE + (right_count * LEAF_NODE_CELL_SIZE)
-    struct.pack_into('I', new_right_node, dest, row_id)
-    new_right_node[dest + 4 : dest + LEAF_NODE_CELL_SIZE] = row_bytes
-    set_node_num_cells(new_right_node, right_count + 1)
-    
-    # 4. Update Root (Internal Node)
-    initialize_internal_node(root_node)
-    set_node_root(root_node, True)
-    set_node_num_cells(root_node, 2) # Two children
-    
-    # Internal Cell 0: [Max_Key=Left_Max, Child=Page 1]
-    cell_0_offset = COMMON_NODE_HEADER_SIZE
-    struct.pack_into('I', root_node, cell_0_offset, left_max_key)
-    struct.pack_into('I', root_node, cell_0_offset + 4, page_1_num)
-    
-    # Internal Cell 1: [Max_Key=MAX_INT, Child=Page 2]
-    cell_1_offset = COMMON_NODE_HEADER_SIZE + INTERNAL_NODE_CELL_SIZE
-    struct.pack_into('I', root_node, cell_1_offset, MAX_INT_KEY)
-    struct.pack_into('I', root_node, cell_1_offset + 4, page_2_num)
-    
-    print(f"DEBUG: Split Root. Internal Node Keys: [{left_max_key}, {MAX_INT_KEY}] -> Pages [{page_1_num}, {page_2_num}]")
-
-def leaf_node_insert(cursor, row_id, row_bytes):
-    node = cursor.table.pager.get_page(cursor.page_num)
-    num_cells = get_node_num_cells(node)
-
-    if num_cells >= LEAF_NODE_MAX_CELLS:
-        # Check if root
-        is_root = struct.unpack_from('B', node, NODE_TYPE_SIZE)[0]
-        if is_root:
-            split_root_node(cursor, row_id, row_bytes)
-        else:
-            print("Error: Splitting non-root leaf not implemented.")
-        return
-
-    offset = COMMON_NODE_HEADER_SIZE + (num_cells * LEAF_NODE_CELL_SIZE)
-    struct.pack_into('I', node, offset, row_id)
-    node[offset + 4 : offset + LEAF_NODE_CELL_SIZE] = row_bytes
-    set_node_num_cells(node, num_cells + 1)
-
-def find_leaf_page(table, row_id):
-    # Start at root
-    page_num = 0
-    node = table.pager.get_page(page_num)
-    node_type = get_node_type(node)
-
-    while node_type == NODE_INTERNAL:
-        num_cells = get_node_num_cells(node)
-        
-        # Search for the right child
-        found_child = False
-        for i in range(num_cells):
-            offset = COMMON_NODE_HEADER_SIZE + (i * INTERNAL_NODE_CELL_SIZE)
-            key = struct.unpack_from('I', node, offset)[0]
-            child_page = struct.unpack_from('I', node, offset + 4)[0]
-            
-            if row_id <= key:
-                page_num = child_page
-                found_child = True
-                break
-        
-        if not found_child:
-            print(f"Error: Key {row_id} exceeds max key in internal node.")
-            return 0
-
-        node = table.pager.get_page(page_num)
-        node_type = get_node_type(node)
-        
-    return page_num
-
-def execute_insert(command, table):
+# --- Database Interface ---
+def execute_insert(command, db, idx, wal):
     parts = command.strip().split()
-    if len(parts) != 4:
-        print("Error: Invalid syntax.")
-        return
-    try:
-        row_id = int(parts[1])
-        username = parts[2]
-        email = parts[3]
-    except ValueError:
-        print("Error: ID must be integer.")
-        return
-
-    # THE REAL B-TREE SEARCH
-    page_num = find_leaf_page(table, row_id)
+    if len(parts) != 4: return print("Error: Syntax 'insert <id> <user> <email>'")
+    try: row_id = int(parts[1])
+    except: return print("Error: ID must be int")
     
-    cursor = Cursor(table)
-    cursor.page_num = page_num
-    
-    row_bytes = serialize_row(row_id, username, email)
-    leaf_node_insert(cursor, row_id, row_bytes)
+    txn_id = wal.log_start(row_id, parts[2], parts[3])
+    db.insert(row_id, serialize_row(row_id, parts[2], parts[3]))
+    idx.insert(hash_email(parts[3]), struct.pack('I', row_id))
+    wal.log_commit(txn_id)
     print("Executed.")
 
-def execute_select(table):
-    cursor = Cursor(table).start_reading()
-    while not cursor.end_of_table:
-        node = table.pager.get_page(cursor.page_num)
-        offset = COMMON_NODE_HEADER_SIZE + (cursor.cell_num * LEAF_NODE_CELL_SIZE)
-        
-        key = struct.unpack_from('I', node, offset)[0]
-        val_offset = offset + 4
-        row_data = node[val_offset : val_offset + ROW_SIZE]
-        row_id, username, email = deserialize_row(row_data)
-        
-        print(f"({row_id}, {username}, {email})")
-        cursor.advance()
+def execute_where(command, db, idx):
+    parts = command.strip().split('=')
+    if len(parts) != 2: return print("Error: Syntax 'where email=<email>'")
+    id_bytes = idx.search(hash_email(parts[1].strip()))
+    if not id_bytes: return print("Not found.")
+    row_bytes = db.search(struct.unpack('I', id_bytes)[0])
+    print(f"Result: {deserialize_row(row_bytes)}" if row_bytes else "Corruption detected.")
 
 def main():
-    table = Table()
+    db, idx, wal = BTree(DB_FILE_NAME, ROW_SIZE), BTree(IDX_FILE_NAME, 4), WAL()
+    wal.recover(db, idx)
     try:
         while True:
             print("db > ", end="", flush=True)
-            try:
-                user_input = input()
-            except EOFError:
-                break
-            
-            if not user_input.strip(): continue
-
-            if user_input.strip().startswith("."):
-                if user_input.strip() == ".exit": break
-                elif user_input.strip() == ".constants":
-                    print(f"Leaf Max: {LEAF_NODE_MAX_CELLS}")
-            
-            elif user_input.strip().startswith("insert"):
-                execute_insert(user_input, table)
-            elif user_input.strip() == "select":
-                execute_select(table)
-            else:
-                print("Unknown command.")
+            try: cmd = input().strip()
+            except EOFError: break
+            if not cmd: continue
+            if cmd == ".exit": break
+            if cmd.startswith("insert"): execute_insert(cmd, db, idx, wal)
+            elif cmd.startswith("where"): execute_where(cmd, db, idx)
     finally:
-        table.close()
+        db.close(); idx.close()
 
 if __name__ == "__main__":
     main()
