@@ -1,45 +1,120 @@
-# PyDB: Relational B-Tree Storage Engine
+# PyDB — A Relational B-Tree Storage Engine (from scratch)
 
-PyDB is a custom, disk-based transactional database engine built entirely from scratch in Python.
+![Python](https://img.shields.io/badge/Python-3.8%2B-3776AB?logo=python&logoColor=white)
+![Dependencies](https://img.shields.io/badge/dependencies-none-success)
+![Concepts](https://img.shields.io/badge/concepts-B--Tree%20%7C%20WAL%20%7C%20Paging-orange)
+![License](https://img.shields.io/badge/License-MIT-yellow.svg)
 
-It bypasses OS-level file caching to implement custom memory paging, raw binary serialization, and a recursive $O(\log N)$ data structure. It was built to deeply understand the low-level mechanics of relational databases like SQLite and PostgreSQL, specifically focusing on disk I/O optimization, indexing, and ACID compliance.
+> A disk-based, transactional database engine written in pure Python with **zero external dependencies** — built to understand how real databases (SQLite, PostgreSQL) work underneath the SQL.
 
-## Core Architecture
+PyDB implements the parts a tutorial usually hand-waves: an **8 KB paged disk manager**, **two B-Tree indexes** (clustered primary + secondary), and a **Write-Ahead Log** with crash recovery — all on top of raw `struct` binary serialization, no ORM, no libraries.
 
-Instead of relying on high-level abstractions, PyDB interacts directly with the file system using raw byte manipulation (`struct` packing).
+---
 
-1. **The Pager (Memory Manager):** Divides the database file into strict `8192-byte` (8KB) pages. This ensures that memory reads/writes align with optimal disk block sizes.
-2. **Dual B-Tree Indexing:** - **Primary Index:** Stores the full row data (291 bytes) clustered by a 4-byte Integer ID.
-   - **Secondary Index:** Stores a 4-byte Email Hash mapped to the Primary ID, turning an $O(N)$ table scan into a sub-millisecond $O(\log N)$ lookup.
-3. **Write-Ahead Log (WAL):** Ensures ACID compliance. All transactions are written to an append-only log and flushed to disk via `os.fsync()` before the B-Tree is modified, completely eliminating the Dual-Write Problem during unexpected power failures.
+## Why I built it
 
-## Benchmarks & Performance
+I wanted to stop treating the database as a black box. So I rebuilt the core ideas from first principles:
 
-Hardware limitations (SSD synchronous write speeds) and algorithmic efficiency were measured using an automated benchmark suite (`benchmark.py`).
+- How do you store rows on disk so reads stay **O(log N)** instead of a full scan?
+- How does a database survive a power-cut **mid-write** without corrupting data?
+- Why is the page size (8 KB) the number it is, and what does it buy you?
 
-**Test Parameters:** 10,000 synthetic rows inserted. 1,000 random reads executed.
+Every answer in PyDB is code I can step through line-by-line — which makes it the project I most enjoy talking through in interviews.
 
-| Metric                   | Result             | Note                                                                                    |
-| :----------------------- | :----------------- | :-------------------------------------------------------------------------------------- |
-| **Write Throughput**     | `2,452 Ops/Sec`    | Constrained by strictly unbatched `os.fsync()` calls ensuring absolute data durability. |
-| **Read Latency (Index)** | `0.295 ms / query` | Near-instant retrieval traversing two separate B-Trees.                                 |
-| **Data Integrity**       | `1000/1000`        | Zero orphan indexes or corrupted pointers.                                              |
-| **Disk Footprint**       | `7.37 MB Total`    | 5.59MB Primary, 0.13MB Secondary Index, 1.66MB WAL.                                     |
+## Architecture
 
-## Deep Dive: The Node Splitting Mechanic
+```mermaid
+flowchart TD
+    CLI["REPL / CLI<br/>insert · where · .exit"] --> EX["Executor"]
+    EX -->|1. log first| WAL[("Write-Ahead Log<br/>append-only + os.fsync()")]
+    EX -->|2. write row| PRI["Primary B-Tree<br/>ID → 291-byte row"]
+    EX -->|3. write index| SEC["Secondary B-Tree<br/>CRC32(email) → ID"]
+    PRI --> PG["Pager<br/>8 KB page cache"]
+    SEC --> PG
+    PG --> DISK[("Disk<br/>mydb.db · email.idx")]
+    WAL -.->|on startup| REC["Crash Recovery<br/>replays uncommitted txns"]
+    REC --> PRI
+```
 
-A standard list appends data. PyDB uses a B-Tree that balances itself. When an 8KB Leaf Node fills its capacity, the engine triggers a split:
+**The flow of a write:** every `insert` is first appended to the WAL and `fsync`'d to disk *before* the B-Trees are touched. If the process dies between steps, recovery on the next boot replays any transaction that has a `START` but no `COMMIT` — eliminating the dual-write problem.
 
-1. Allocates a new 8KB page via the Pager.
-2. Migrates the upper 50% of the byte-array to the new page.
-3. Updates the Internal Node (Parent) with the new boundary keys and child pointers.
-4. Maintains sorting across the physical disk.
+## How it works
 
-## Quick Start
+| Component | What it does |
+| :-- | :-- |
+| **Pager** | Splits the file into strict **8192-byte pages**, manages an in-memory page cache, and is the *only* component that talks to disk — so I/O alignment is controlled in one place. |
+| **Primary B-Tree** | Clustered index: 4-byte integer `ID` → the full 291-byte row (`ID(4) + username(32) + email(255)`). Self-balancing via leaf-node splits and root promotion. |
+| **Secondary Index** | A second B-Tree mapping a 4-byte `CRC32(email)` hash → primary `ID`, turning an O(N) table scan over emails into an **O(log N)** lookup. |
+| **WAL** | Append-only JSON log; `START`/`COMMIT` records flushed with `os.fsync()` give durability and crash recovery. |
 
-**Prerequisites:** Python 3.8+ (No external dependencies required).
+## Benchmarks
 
-**Supported CLI Commands**
-`db > insert 1 anirudh anichandan124@gmail.com
-db > where email=anichandan124@gmail.com
-db > .exit`
+Measured by `benchmark.py` (10,000 inserts as ACID transactions, then 1,000 random indexed reads):
+
+| Metric | Result | Note |
+| :-- | :-- | :-- |
+| **Write throughput** | `~2,452 ops/sec` | Deliberately bottlenecked by one `os.fsync()` **per transaction** — the price of true durability. |
+| **Indexed read latency** | `~0.295 ms/query` | Two B-Tree traversals (secondary → primary). |
+| **Data integrity** | `1000 / 1000` | Zero orphaned indexes or dangling pointers. |
+| **Disk footprint** | `~7.37 MB` | 5.59 MB primary · 0.13 MB index · 1.66 MB WAL. |
+
+Reproduce it yourself:
+
+```bash
+python3 benchmark.py
+```
+
+## Quick start
+
+No dependencies — Python 3.8+ only.
+
+```bash
+git clone https://github.com/AnirudhChandan/PyDB.git
+cd PyDB
+python3 main.py
+```
+
+```text
+db > insert 1 anirudh anirudh@example.com
+Executed.
+db > where email=anirudh@example.com
+Result: (1, 'anirudh', 'anirudh@example.com')
+db > .exit
+```
+
+To see crash recovery in action: start an insert, kill the process before `.exit`, and restart — PyDB prints `CRASH DETECTED. Recovering N txns...` and restores the data from the WAL.
+
+## Project structure
+
+```
+PyDB/
+├── main.py        # Pager, BTree, WAL, and the CLI executor
+├── benchmark.py   # throughput / latency / footprint harness
+├── mydb.db        # primary store (generated)
+├── email.idx      # secondary index (generated)
+└── wal.log        # write-ahead log (generated)
+```
+
+## Design decisions & tradeoffs
+
+- **fsync per transaction** caps write throughput on purpose — I chose *durability over speed*. Batching commits would multiply throughput but weaken the durability guarantee; that tradeoff is the whole point of the project.
+- **Hash-based secondary index** keeps keys a fixed 4 bytes (fast, simple) at the cost of not supporting range scans on email and not yet handling hash collisions (see below).
+- **Pager owns all I/O** so the B-Tree logic stays pure in-memory byte manipulation and is easy to reason about.
+
+## Known limitations & roadmap
+
+Being honest about scope is part of the exercise:
+
+- [ ] **Secondary-index hash collisions** are not yet resolved (CRC32 collisions would shadow a row) — next up: collision chaining.
+- [ ] **Internal-node splitting** is bounded; a very large tree hits a `FATAL` guard instead of splitting internal nodes recursively.
+- [ ] Single-threaded, single-process; no concurrency control / locking yet.
+- [ ] Fixed schema (`id, username, email`) and only equality lookups — no SQL parser or range queries.
+- [ ] WAL is never truncated/checkpointed, so it grows unbounded.
+
+## What I learned
+
+Paging and block alignment, B-Tree splitting and parent routing, why WAL ordering (`log → fsync → mutate`) is the backbone of ACID durability, and how to design a benchmark that measures the *engine* and not Python's string allocation.
+
+## License
+
+MIT
