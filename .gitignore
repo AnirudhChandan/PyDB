@@ -7,3 +7,10 @@
 __pycache__/
 *.py[cod]
 *$py.class
+# Checkpoint temp files
+*.tmp
+
+# Tooling
+.pytest_cache/
+.venv/
+venv/
